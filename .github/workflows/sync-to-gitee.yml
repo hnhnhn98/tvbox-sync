@@ -28,10 +28,13 @@ jobs:
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
           set -e
-          git clone --depth 1 "https://${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" gitee-repo
+          OWNER="${GITEE_REPO%%/*}"
+          git clone --depth 1 "https://${OWNER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" gitee-repo
           cd gitee-repo
           git config user.name  "gitee-sync-bot"
           git config user.email "bot@users.noreply.github.com"
+          git remote set-url origin "https://${OWNER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
+          echo "::add-mask::${GITEE_TOKEN}"
 
       - name: 拉取最新配置
         run: |
@@ -114,13 +117,15 @@ jobs:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
+          set -e
           cd gitee-repo
+          echo "*.raw.json" > .gitignore
           git add -A
           if git diff --staged --quiet; then
             echo "无变化，跳过推送"
           else
             git commit -q -m "自动同步 $(date -u '+%Y-%m-%d %H:%M UTC')"
-            git push "https://${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" HEAD:master
+            git push origin HEAD:master
             echo "已推送到 Gitee"
           fi
 
