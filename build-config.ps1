@@ -5,7 +5,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Base,
     [Parameter(Mandatory = $true)][string]$Out,
     [string[]]$Lives,
-    [string]$LiveSpec   # 命令行传参用："名称|路径;名称|路径"
+    [string]$LiveSpec,   # 命令行传参用："名称|路径;名称|路径"
+    [string]$SpiderExt   # spider 引擎的远端文件后缀替换（如 ".bin"）。原因：jsDelivr 屏蔽 .jar，
+                         # 而影视仓本地缓存名是 md5(url)+".jar"（Path.jar），远端叫什么都无所谓
 )
 $ErrorActionPreference = 'Stop'
 $Base = $Base.TrimEnd('/') + '/'
@@ -79,7 +81,9 @@ $j = Get-Content -LiteralPath $Source -Raw -Encoding UTF8 | ConvertFrom-Json
 # 1) spider: "./jar/x.jar;md5;hash"  ->  绝对URL;md5;hash
 if ($j.spider) {
     $parts = ([string]$j.spider) -split ';md5;', 2
-    $j.spider = (Abs-Scalar $parts[0] $false)
+    $path0 = $parts[0]
+    if ($SpiderExt -and $path0 -match '\.jar$') { $path0 = $path0 -replace '\.jar$', $SpiderExt }
+    $j.spider = (Abs-Scalar $path0 $false)
     if ($parts.Count -gt 1) { $j.spider = $j.spider + ';md5;' + $parts[1] }
 }
 
