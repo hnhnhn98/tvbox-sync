@@ -67,6 +67,13 @@ jobs:
               echo "  skip $rel (上游不存在)"
             fi
           done < need.txt
+          # jsDelivr 会屏蔽 .jar 后缀（返回 403 Forbidden），但影视仓本地缓存名是 md5(url)+".jar"
+          # （Path.jar），远端文件名无所谓，所以复制一份 .bin 出来给 CDN 发
+          for f in jar/*.jar; do
+            [ -e "$f" ] || continue
+            cp "$f" "${f%.jar}.bin"
+            echo "  改名 ${f%.jar}.bin"
+          done
 
       - name: 生成配置（相对路径 → 绝对 URL）
         run: |
@@ -75,9 +82,9 @@ jobs:
           RAW="https://cdn.jsdmirror.com/gh/${GITHUB_REPOSITORY}@publish"
           SPEC='直播·移动CDN(全)|./tvlive.txt;直播·央视卫视(精简)|./live/list.txt;直播·每日有效源(过滤后)|./live/bbxx365.txt;广播·电台|./live/radio.txt'
           for n in 0827 367 fty 9918; do
-            pwsh -NoProfile -File ../src/build-config.ps1 -Source "$n.raw.json" -Base "$RAW/" -Out "alt-$n.json" -LiveSpec "$SPEC"
+            pwsh -NoProfile -File ../src/build-config.ps1 -Source "$n.raw.json" -Base "$RAW/" -Out "alt-$n.json" -LiveSpec "$SPEC" -SpiderExt ".bin"
           done
-          pwsh -NoProfile -File ../src/build-config.ps1 -Source js.raw.json -Base "$RAW/" -Out fongmi-main.json -LiveSpec "$SPEC"
+          pwsh -NoProfile -File ../src/build-config.ps1 -Source js.raw.json -Base "$RAW/" -Out fongmi-main.json -LiveSpec "$SPEC" -SpiderExt ".bin"
           # 直播源文件
           BASE=https://raw.githubusercontent.com/qist/tvbox/master
           curl -fsSL --retry 3 "$BASE/tvlive.txt" -o tvlive.txt
@@ -108,7 +115,9 @@ jobs:
             if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { throw "检测到 BOM" }
             Write-Host "  无 BOM OK"
             $decl = ($c.spider -split ";md5;")[1]
-            $act = (Get-FileHash jar/pg_upgraded.jar -Algorithm MD5).Hash.ToLower()
+            Write-Host "  spider = $($c.spider)"
+            if ($c.spider -notmatch "\.bin") { throw "spider 没有改成 .bin 后缀" }
+            $act = (Get-FileHash jar/pg_upgraded.bin -Algorithm MD5).Hash.ToLower()
             Write-Host "  MD5 声明=$decl 实际=$act"
             if ($decl -ne $act) { throw "MD5 不一致" }
             Write-Host "  MD5 一致 OK"
@@ -127,7 +136,7 @@ jobs:
 
       - name: 镜像到 Gitee（尽力而为，失败不影响主链路）
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 25
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
@@ -148,10 +157,18 @@ jobs:
           SPEC='直播·移动CDN(全)|./tvlive.txt;直播·央视卫视(精简)|./live/list.txt;直播·每日有效源(过滤后)|./live/bbxx365.txt;广播·电台|./live/radio.txt'
           cp ../publish/*.raw.json .
           for n in 0827 367 fty 9918; do
-            pwsh -NoProfile -File ../src/build-config.ps1 -Source "$n.raw.json" -Base "$RAW/" -Out "alt-$n.json" -LiveSpec "$SPEC"
+            pwsh -NoProfile -File ../src/build-config.ps1 -Source "$n.raw.json" -Base "$RAW/" -Out "alt-$n.json" -LiveSpec "$SPEC" -SpiderExt ".bin"
           done
-          pwsh -NoProfile -File ../src/build-config.ps1 -Source js.raw.json -Base "$RAW/" -Out fongmi-main.json -LiveSpec "$SPEC"
+          pwsh -NoProfile -File ../src/build-config.ps1 -Source js.raw.json -Base "$RAW/" -Out fongmi-main.json -LiveSpec "$SPEC" -SpiderExt ".bin"
           rm -f *.raw.json
+          # 安装包也放 Gitee：电视浏览器可直接下载，实现"连电脑都不用碰"
+          APK=FongMi-TV-5.8.5-leanback-arm64_v8a.apk
+          if [ ! -f "$APK" ]; then
+            curl -fsSL --retry 3 \
+              "https://github.com/FongMi/Release/releases/download/5.8.5/leanback-arm64_v8a.apk" -o "$APK" \
+              || echo "  安装包下载失败，跳过"
+          fi
+          ls -la "$APK" 2>/dev/null || true
           git add -A
           git commit -q -m "同步 $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "无变化"
           git -c http.postBuffer=524288000 push origin HEAD:master
@@ -161,8 +178,12 @@ jobs:
         run: |
           echo "--------------------------------------------------"
           echo "电视端订阅地址（任选一条，都是同一份内容）："
+          echo "  https://jsdelivr.b-cdn.net/gh/${{ github.repository }}@publish/fongmi-main.json   （最快，推荐）"
           echo "  https://cdn.jsdmirror.com/gh/${{ github.repository }}@publish/fongmi-main.json"
           echo "  https://gcore.jsdelivr.net/gh/${{ github.repository }}@publish/fongmi-main.json"
-          echo "  https://jsdelivr.b-cdn.net/gh/${{ github.repository }}@publish/fongmi-main.json"
-          echo "  https://gitee.com/${{ secrets.GITEE_REPO }}/raw/master/fongmi-main.json   (镜像，不保证每次都同步成功)"
+          echo "  https://testingcf.jsdelivr.net/gh/${{ github.repository }}@publish/fongmi-main.json"
+          echo "  https://gitee.com/${{ secrets.GITEE_REPO }}/raw/master/fongmi-main.json   (镜像，可能被风控 451)"
+          echo ""
+          echo "安装包下载地址（电视浏览器直接下载，免电脑）："
+          echo "  https://gitee.com/${{ secrets.GITEE_REPO }}/raw/master/FongMi-TV-5.8.5-leanback-arm64_v8a.apk"
           echo "--------------------------------------------------"
