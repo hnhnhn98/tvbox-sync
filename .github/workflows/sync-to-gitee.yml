@@ -1,0 +1,133 @@
+name: 同步 TVBox 源到 Gitee
+
+# 每天北京时间 06:10 自动执行；之后电视端完全不需要电脑
+on:
+  schedule:
+    - cron: '10 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查 PowerShell
+        run: |
+          set -e
+          command -v pwsh >/dev/null || { echo "未找到 pwsh"; exit 1; }
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+
+      - name: 检出 Gitee 目标仓库
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          set -e
+          git clone --depth 1 "https://${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" gitee-repo
+          cd gitee-repo
+          git config user.name  "gitee-sync-bot"
+          git config user.email "bot@users.noreply.github.com"
+
+      - name: 拉取最新配置
+        run: |
+          set -e
+          cd gitee-repo
+          BASE=https://raw.githubusercontent.com/qist/tvbox/master
+          mkdir -p live jar lib js cat FTY json
+          for n in js 0827 367 fty 9918; do
+            curl -fsSL --retry 3 "$BASE/$n.json" -o "$n.raw.json"
+          done
+
+      - name: 扫描并下载配置引用的全部相对资源
+        run: |
+          set -e
+          cd gitee-repo
+          BASE=https://raw.githubusercontent.com/qist/tvbox/master
+          # 从原始 JSON 里抓出所有 "./xxx" 字符串，切掉 $$$参数 与 ;md5; 后缀
+          grep -ohE '"\./[^"]*"' ./*.raw.json \
+            | sed 's/^"//; s/"$//' \
+            | awk -F'[$;]' '{print $1}' | sed 's|^\./||' | sort -u > need.txt
+          echo "需要下载 $(wc -l < need.txt) 个相对资源"
+          while IFS= read -r rel; do
+            [ -z "$rel" ] && continue
+            mkdir -p "$(dirname "$rel")"
+            enc=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$rel")
+            if curl -fsSL --retry 2 "$BASE/$enc" -o "$rel"; then
+              echo "  ok   $rel"
+            else
+              rm -f "$rel"
+              echo "  skip $rel (上游不存在)"
+            fi
+          done < need.txt
+
+      - name: 生成配置（相对路径 → Gitee 绝对 URL）
+        env:
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          set -e
+          cd gitee-repo
+          RAW="https://gitee.com/${GITEE_REPO}/raw/master"
+          SPEC='直播·移动CDN(全)|./tvlive.txt;直播·央视卫视(精简)|./live/list.txt;直播·每日有效源(过滤后)|./live/bbxx365.txt;广播·电台|./live/radio.txt'
+          for n in 0827 367 fty 9918; do
+            pwsh -NoProfile -File ../build-config.ps1 -Source "$n.raw.json" -Base "$RAW/" -Out "alt-$n.json" -LiveSpec "$SPEC"
+          done
+          pwsh -NoProfile -File ../build-config.ps1 -Source js.raw.json -Base "$RAW/" -Out fongmi-main.json -LiveSpec "$SPEC"
+          # 直播源文件
+          BASE=https://raw.githubusercontent.com/qist/tvbox/master
+          curl -fsSL --retry 3 "$BASE/tvlive.txt" -o tvlive.txt
+          for f in list.txt ITV.txt zb.txt radio.txt; do curl -fsSL --retry 3 "$BASE/$f" -o "live/$f"; done
+          curl -fsSL --retry 3 https://raw.githubusercontent.com/kimwang1978/collect-txt/main/bbxx365.txt       -o live/bbxx365.txt
+          curl -fsSL --retry 3 https://raw.githubusercontent.com/kimwang1978/collect-txt/main/bbxx365_lite.txt -o live/bbxx365_lite.txt
+          curl -fsSL --retry 3 https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/ipv6.m3u        -o live/fanmingming-ipv6.m3u
+
+      - name: 校验（无相对路径 / 无 BOM / MD5 一致）
+        run: |
+          set -e
+          cd gitee-repo
+          pwsh -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            $raw = Get-Content fongmi-main.json -Raw -Encoding UTF8
+            $c = $raw | ConvertFrom-Json
+            $bad = 0
+            if ($c.spider -match "^\./") { $bad++ }
+            foreach ($s in $c.sites) { if ($s.api -match "^\./") { $bad++ }; if ($s.ext -match "^\./") { $bad++ } }
+            foreach ($l in $c.lives)  { if ($l.url -match "^\./") { $bad++ } }
+            if ($bad -gt 0) { throw "仍有 $bad 处相对路径" }
+            Write-Host "  无相对路径 OK"
+            $bytes = [System.IO.File]::ReadAllBytes("fongmi-main.json")
+            if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { throw "检测到 BOM" }
+            Write-Host "  无 BOM OK"
+            $decl = ($c.spider -split ";md5;")[1]
+            $act = (Get-FileHash jar/pg_upgraded.jar -Algorithm MD5).Hash.ToLower()
+            Write-Host "  MD5 声明=$decl 实际=$act"
+            if ($decl -ne $act) { throw "MD5 不一致" }
+            Write-Host "  MD5 一致 OK"
+          '
+
+      - name: 提交并推送到 Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          cd gitee-repo
+          git add -A
+          if git diff --staged --quiet; then
+            echo "无变化，跳过推送"
+          else
+            git commit -q -m "自动同步 $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push "https://${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" HEAD:master
+            echo "已推送到 Gitee"
+          fi
+
+      - name: 输出电视端应填的地址
+        env:
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          echo "--------------------------------------------------"
+          echo "电视端订阅地址（raw 直链，不需要开 Pages）："
+          echo "https://gitee.com/${{ secrets.GITEE_REPO }}/raw/master/fongmi-main.json"
+          echo "若已开通 Gitee Pages，则用："
+          echo "https://<你的账号>.gitee.io/<仓库名>/fongmi-main.json"
+          echo "--------------------------------------------------"
