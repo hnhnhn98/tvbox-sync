@@ -1,13 +1,14 @@
 name: 同步 TVBox 源到 Gitee
 
 # 每天北京时间 06:10 自动执行；之后电视端完全不需要电脑
+# 产物发布到本仓库的 publish 分支，再由 jsDelivr 国内镜像分发，电视直连镜像即可
 on:
   schedule:
     - cron: '10 22 * * *'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # 需要把产物推到本仓库的 publish 分支
 
 jobs:
   sync:
@@ -15,41 +16,40 @@ jobs:
     steps:
       - name: 检出本仓库(拿到 build-config.ps1)
         uses: actions/checkout@v4
+        with:
+          path: src
 
-      - name: 检查 PowerShell
-        run: |
-          set -e
-          command -v pwsh >/dev/null || { echo "未找到 pwsh"; exit 1; }
-          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
-
-      - name: 检出 Gitee 目标仓库
+      - name: 准备发布工作区
         env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          OWNER="${GITEE_REPO%%/*}"
-          git clone --depth 1 "https://${OWNER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" gitee-repo
-          cd gitee-repo
-          git config user.name  "gitee-sync-bot"
+          mkdir -p publish && cd publish
+          git init -q
+          git config user.name  "tvbox-sync-bot"
           git config user.email "bot@users.noreply.github.com"
-          git remote set-url origin "https://${OWNER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
-          echo "::add-mask::${GITEE_TOKEN}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # 每次都做成一条全新历史，仓库体积不会一天天膨胀
+          git checkout -B publish
+          git clean -fdx
+          echo "*.raw.json" > .gitignore
+          echo "已就绪：publish 分支工作区"
 
       - name: 拉取最新配置
         run: |
           set -e
-          cd gitee-repo
+          cd publish
           BASE=https://raw.githubusercontent.com/qist/tvbox/master
           mkdir -p live jar lib js cat FTY json
           for n in js 0827 367 fty 9918; do
             curl -fsSL --retry 3 "$BASE/$n.json" -o "$n.raw.json"
           done
+          echo "已拉取 5 份原始配置"
 
       - name: 扫描并下载配置引用的全部相对资源
         run: |
           set -e
-          cd gitee-repo
+          cd publish
           BASE=https://raw.githubusercontent.com/qist/tvbox/master
           # 从原始 JSON 里抓出所有 "./xxx" 字符串，切掉 $$$参数 与 ;md5; 后缀
           grep -ohE '"\./[^"]*"' ./*.raw.json \
@@ -68,18 +68,16 @@ jobs:
             fi
           done < need.txt
 
-      - name: 生成配置（相对路径 → Gitee 绝对 URL）
-        env:
-          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+      - name: 生成配置（相对路径 → 绝对 URL）
         run: |
           set -e
-          cd gitee-repo
-          RAW="https://gitee.com/${GITEE_REPO}/raw/master"
+          cd publish
+          RAW="https://cdn.jsdmirror.com/gh/${GITHUB_REPOSITORY}@publish"
           SPEC='直播·移动CDN(全)|./tvlive.txt;直播·央视卫视(精简)|./live/list.txt;直播·每日有效源(过滤后)|./live/bbxx365.txt;广播·电台|./live/radio.txt'
           for n in 0827 367 fty 9918; do
-            pwsh -NoProfile -File ../build-config.ps1 -Source "$n.raw.json" -Base "$RAW/" -Out "alt-$n.json" -LiveSpec "$SPEC"
+            pwsh -NoProfile -File ../src/build-config.ps1 -Source "$n.raw.json" -Base "$RAW/" -Out "alt-$n.json" -LiveSpec "$SPEC"
           done
-          pwsh -NoProfile -File ../build-config.ps1 -Source js.raw.json -Base "$RAW/" -Out fongmi-main.json -LiveSpec "$SPEC"
+          pwsh -NoProfile -File ../src/build-config.ps1 -Source js.raw.json -Base "$RAW/" -Out fongmi-main.json -LiveSpec "$SPEC"
           # 直播源文件
           BASE=https://raw.githubusercontent.com/qist/tvbox/master
           curl -fsSL --retry 3 "$BASE/tvlive.txt" -o tvlive.txt
@@ -87,21 +85,25 @@ jobs:
           curl -fsSL --retry 3 https://raw.githubusercontent.com/kimwang1978/collect-txt/main/bbxx365.txt       -o live/bbxx365.txt
           curl -fsSL --retry 3 https://raw.githubusercontent.com/kimwang1978/collect-txt/main/bbxx365_lite.txt -o live/bbxx365_lite.txt
           curl -fsSL --retry 3 https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/ipv6.m3u        -o live/fanmingming-ipv6.m3u
+          ls -la *.json | head -20
 
-      - name: 校验（无相对路径 / 无 BOM / MD5 一致）
+      - name: 校验（无相对路径 / ext 结构 / 无 BOM / MD5 一致）
         run: |
           set -e
-          cd gitee-repo
+          cd publish
           pwsh -NoProfile -Command '
             $ErrorActionPreference = "Stop"
-            $raw = Get-Content fongmi-main.json -Raw -Encoding UTF8
-            $c = $raw | ConvertFrom-Json
+            $c = Get-Content fongmi-main.json -Raw -Encoding UTF8 | ConvertFrom-Json
             $bad = 0
             if ($c.spider -match "^\./") { $bad++ }
             foreach ($s in $c.sites) { if ($s.api -match "^\./") { $bad++ }; if ($s.ext -match "^\./") { $bad++ } }
             foreach ($l in $c.lives)  { if ($l.url -match "^\./") { $bad++ } }
             if ($bad -gt 0) { throw "仍有 $bad 处相对路径" }
             Write-Host "  无相对路径 OK"
+            $broken = 0
+            foreach ($s in $c.sites) { if ($s.ext -is [string] -and $s.ext -match "^[@\{]") { $broken++ } }
+            if ($broken -gt 0) { throw "$broken 个站点的 ext 结构损坏" }
+            Write-Host "  ext 结构 OK"
             $bytes = [System.IO.File]::ReadAllBytes("fongmi-main.json")
             if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { throw "检测到 BOM" }
             Write-Host "  无 BOM OK"
@@ -112,30 +114,55 @@ jobs:
             Write-Host "  MD5 一致 OK"
           '
 
-      - name: 提交并推送到 Gitee
+      - name: 发布到 GitHub publish 分支（jsDelivr 镜像由此分发）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          cd publish
+          git add -A
+          git commit -q -m "publish $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "无变化"
+          git push --force origin publish
+          echo "已发布到 publish 分支"
+
+      - name: 镜像到 Gitee（尽力而为，失败不影响主链路）
+        continue-on-error: true
+        timeout-minutes: 10
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
           set -e
-          cd gitee-repo
-          echo "*.raw.json" > .gitignore
+          OWNER="${GITEE_REPO%%/*}"
+          export GIT_TERMINAL_PROMPT=0
+          git clone --depth 1 "https://${OWNER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" gitee-mirror
+          cd gitee-mirror
+          git config user.name  "tvbox-sync-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git remote set-url origin "https://${OWNER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
+          # 复制资源
+          cp -r ../publish/jar ../publish/lib ../publish/js ../publish/json ../publish/FTY ../publish/live . 2>/dev/null || true
+          cp ../publish/tvlive.txt .
+          # 用 Gitee 基准重新生成一份配置，保证 Gitee 这份自洽
+          RAW="https://gitee.com/${GITEE_REPO}/raw/master"
+          SPEC='直播·移动CDN(全)|./tvlive.txt;直播·央视卫视(精简)|./live/list.txt;直播·每日有效源(过滤后)|./live/bbxx365.txt;广播·电台|./live/radio.txt'
+          cp ../publish/*.raw.json .
+          for n in 0827 367 fty 9918; do
+            pwsh -NoProfile -File ../src/build-config.ps1 -Source "$n.raw.json" -Base "$RAW/" -Out "alt-$n.json" -LiveSpec "$SPEC"
+          done
+          pwsh -NoProfile -File ../src/build-config.ps1 -Source js.raw.json -Base "$RAW/" -Out fongmi-main.json -LiveSpec "$SPEC"
+          rm -f *.raw.json
           git add -A
-          if git diff --staged --quiet; then
-            echo "无变化，跳过推送"
-          else
-            git commit -q -m "自动同步 $(date -u '+%Y-%m-%d %H:%M UTC')"
-            git push origin HEAD:master
-            echo "已推送到 Gitee"
-          fi
+          git commit -q -m "同步 $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "无变化"
+          git -c http.postBuffer=524288000 push origin HEAD:master
+          echo "已镜像到 Gitee"
 
       - name: 输出电视端应填的地址
-        env:
-          GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
           echo "--------------------------------------------------"
-          echo "电视端订阅地址（raw 直链，不需要开 Pages）："
-          echo "https://gitee.com/${{ secrets.GITEE_REPO }}/raw/master/fongmi-main.json"
-          echo "若已开通 Gitee Pages，则用："
-          echo "https://<你的账号>.gitee.io/<仓库名>/fongmi-main.json"
+          echo "电视端订阅地址（任选一条，都是同一份内容）："
+          echo "  https://cdn.jsdmirror.com/gh/${{ github.repository }}@publish/fongmi-main.json"
+          echo "  https://gcore.jsdelivr.net/gh/${{ github.repository }}@publish/fongmi-main.json"
+          echo "  https://jsdelivr.b-cdn.net/gh/${{ github.repository }}@publish/fongmi-main.json"
+          echo "  https://gitee.com/${{ secrets.GITEE_REPO }}/raw/master/fongmi-main.json   (镜像，不保证每次都同步成功)"
           echo "--------------------------------------------------"
